@@ -1,5 +1,6 @@
 import logging
 import os
+import base64
 from dotenv import load_dotenv
 from livekit.agents import (
     AutoSubscribe,
@@ -14,47 +15,78 @@ from livekit.plugins import openai, deepgram, silero, elevenlabs
 from prompts.base import system_prompt
 from livekit.plugins.elevenlabs.tts import Voice, VoiceSettings
 from typing import Annotated, Dict
-import os
 from supabase import create_client, Client
+from PIL import Image
+import fitz
 
 load_dotenv(dotenv_path=".env.local")
+
 url: str = os.environ.get("SUPABASE_URL")
 key: str = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(url, key)
 
 logger = logging.getLogger("voice-agent")
+logging.basicConfig(level=logging.INFO)
 
-def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+from openai import OpenAI
+
+client = OpenAI()
+
+if not os.getenv('OPENAI_API_KEY'):
+    raise ValueError("OpenAI API key not found. Please check your .env file.")
+
+images_folder = 'output_images'
+
+gpt_model = "gpt-4o-mini"
+
+def encode_image_to_base64(image_path):
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+    return encoded_string
+
+def analyze_images_with_gpt(question, image_paths):
+    try:
+        message_content = {"type": "text", "text": question}
+        for image_path in image_paths:
+            base64_image = encode_image_to_base64(image_path)
+            message_content = [
+                {"type": "text", "text": question},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }
+                }
+            ]
+        response = client.chat.completions.create(
+            model=gpt_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": message_content
+                }
+            ],
+            max_tokens=1000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error during GPT-4 Vision analysis: {e}"
+
+def get_all_image_paths(folder):
+    supported_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')
+    image_paths = [
+        os.path.join(folder, file)
+        for file in os.listdir(folder)
+        if file.lower().endswith(supported_formats)
+    ]
+    return image_paths
 
 class AssistantFnc(llm.FunctionContext):
-    # the llm.ai_callable decorator marks this function as a tool available to the LLM
-    # by default, it'll use the docstring as the function's description
-
-    
-    @llm.ai_callable( description="Process a payment")
-    async def process_payment(
-        self,
-        # by using the Annotated type, arg description and type are available to the LLM
-        card_number: Annotated[
-            int, llm.TypeInfo(description="The card number to process the payment for")
-        ],
-        card_expiry: Annotated[
-            str, llm.TypeInfo(description="The expiry date of the card")
-        ],
-        card_cvv: Annotated[
-            int, llm.TypeInfo(description="The CVV of the card")
-        ],
-        card_name: Annotated[
-            str, llm.TypeInfo(description="The name on the card")
-        ],
-    ):
-        
-        return "Payment processed successfully"
-    
-    @llm.ai_callable()
-    async def get_order_details(self):
-        return "Order details"
+    @llm.ai_callable(description="Answer user questions based on existing images.")
+    async def answer_question(self, question: Annotated[str, llm.TypeInfo(description="The user's question about the images.")]):
+        image_paths = get_all_image_paths(images_folder)
+        answer = analyze_images_with_gpt(question, image_paths)
+        return answer
 
 fnc_ctx = AssistantFnc()
 
@@ -64,36 +96,32 @@ async def entrypoint(ctx: JobContext):
         text=system_prompt,
     )
 
-    logger.info(f"connecting to room {ctx.room.name}")
+    logger.info(f"Connecting to room {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Wait for the first participant to connect
     participant = await ctx.wait_for_participant()
-    logger.info(f"starting voice assistant for participant {participant.identity}")
+    logger.info(f"Starting voice assistant for participant {participant.identity}")
 
-    # This project is configured to use Deepgram STT, OpenAI LLM and TTS plugins
-    # Other great providers exist like Cartesia and ElevenLabs
-    # Learn more and pick the best one for your app:
-    # https://docs.livekit.io/agents/plugins
     assistant = VoicePipelineAgent(
         vad=silero.VAD.load(),
         stt=deepgram.STT(),
         llm=openai.LLM(model="gpt-4o-mini"),
-        tts=elevenlabs.TTS(model_id="eleven_turbo_v2",api_key=os.getenv("ELEVENLABS_API_KEY")),
+        tts=elevenlabs.TTS(
+            model_id="eleven_turbo_v2",
+            api_key=os.getenv("ELEVENLABS_API_KEY")
+        ),
         chat_ctx=initial_ctx,
         fnc_ctx=fnc_ctx,
     )
 
     assistant.start(ctx.room, participant)
 
-    # The agent should be polite and greet the user when it joins :)
-    await assistant.say("Hi I'm Amy from Slice-sync, happy to help you with your order!", allow_interruptions=True)
-
+    await assistant.say("Hello! How can I assist you today?", allow_interruptions=True)
 
 if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
+            prewarm_fnc=lambda proc: proc.userdata.update({"vad": silero.VAD.load()}),
         ),
     )
