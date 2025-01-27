@@ -1,6 +1,6 @@
-import logging
 import os
-import base64
+import asyncio
+import logging
 from dotenv import load_dotenv
 from livekit.agents import (
     AutoSubscribe,
@@ -10,85 +10,103 @@ from livekit.agents import (
     cli,
     llm,
 )
-from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.plugins import openai, deepgram, silero, elevenlabs
+from livekit.agents.voice_assistant import VoiceAssistant
+from livekit.plugins import openai, deepgram, silero, elevenlabs, turn_detector
 from prompts.base import system_prompt
-from livekit.plugins.elevenlabs.tts import Voice, VoiceSettings
-from typing import Annotated, Dict
-from supabase import create_client, Client
-from PIL import Image
-import fitz
+from typing import Annotated, List
+import time
+from pinecone import Pinecone
+from openai import AsyncOpenAI
 
 load_dotenv(dotenv_path=".env.local")
-
-url: str = os.environ.get("SUPABASE_URL")
-key: str = os.environ.get("SUPABASE_KEY")
-supabase: Client = create_client(url, key)
-
 logger = logging.getLogger("voice-agent")
 logging.basicConfig(level=logging.INFO)
 
-from openai import OpenAI
-
-client = OpenAI()
-
-if not os.getenv('OPENAI_API_KEY'):
-    raise ValueError("OpenAI API key not found. Please check your .env file.")
-
-images_folder = 'output_images'
-
 gpt_model = "gpt-4o-mini"
 
-def encode_image_to_base64(image_path):
-    with open(image_path, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-    return encoded_string
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
 
-def analyze_images_with_gpt(question, image_paths):
-    try:
-        message_content = {"type": "text", "text": question}
-        for image_path in image_paths:
-            base64_image = encode_image_to_base64(image_path)
-            message_content = [
-                {"type": "text", "text": question},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_image}"
-                    }
-                }
-            ]
-        response = client.chat.completions.create(
-            model=gpt_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ],
-            max_tokens=1000
+class RAG(llm.FunctionContext):
+    def __init__(self):
+        super().__init__()
+        self.openai_client = AsyncOpenAI()
+        
+        # Initialize Pinecone
+        self.pc = Pinecone(
+            api_key=os.getenv("PINECONE_API_KEY")
         )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error during GPT-4 Vision analysis: {e}"
+        
+        # Connect to index
+        self.index_name = os.getenv("PINECONE_INDEX_NAME")
+        self.index = self.pc.Index(self.index_name)
 
-def get_all_image_paths(folder):
-    supported_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')
-    image_paths = [
-        os.path.join(folder, file)
-        for file in os.listdir(folder)
-        if file.lower().endswith(supported_formats)
-    ]
-    return image_paths
-
-class AssistantFnc(llm.FunctionContext):
-    @llm.ai_callable(description="Answer user questions based on existing images.")
-    async def answer_question(self, question: Annotated[str, llm.TypeInfo(description="The user's question about the images.")]):
-        image_paths = get_all_image_paths(images_folder)
-        answer = analyze_images_with_gpt(question, image_paths)
-        return answer
-
-fnc_ctx = AssistantFnc()
+    async def get_embedding(self, text: str) -> List[float]:
+        """Get embedding for text using OpenAI's API."""
+        try:
+            response = await self.openai_client.embeddings.create(
+                input=text,
+                model="text-embedding-ada-002"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Error getting embedding: {e}")
+            return None
+    
+    @llm.ai_callable()
+    async def run(self, query: Annotated[str, "The user's question"]):
+        """Get context from documents to answer questions."""
+        logger.info(f"Running RAG for query: {query}")
+        
+        start_time = time.time()
+        
+        try:
+            # Get query embedding
+            query_embedding = await self.get_embedding(query)
+            if not query_embedding:
+                return "I apologize, but I encountered an error while processing your question. Please try again."
+            
+            # Query Pinecone
+            results = self.index.query(
+                vector=query_embedding,
+                top_k=3,
+                include_metadata=True
+            )
+            
+            if not results.matches:
+                return "I apologize, but I don't have enough context to answer that question accurately. Could you please rephrase or ask about something else?"
+            
+            # Format contexts with relevance scores
+            contexts = []
+            for match in results.matches:
+                contexts.append({
+                    'text': match.metadata.get('text', ''),
+                    'metadata': match.metadata,
+                    'relevance': match.score
+                })
+            
+            # Sort by relevance and combine
+            contexts.sort(key=lambda x: x['relevance'], reverse=True)
+            combined_context = "\n\n".join(
+                f"Context (relevance: {c['relevance']:.2f}):\n{c['text']}" 
+                for c in contexts
+            )
+            
+            logger.debug(f"Query time: {time.time() - start_time:.2f}s")
+            
+            # Format response with context
+            response = f"""
+            Based on the following contexts:
+            {combined_context}
+            
+            Here's the answer to your question: {query}
+            """
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error querying Pinecone: {e}")
+            return "I apologize, but I encountered an error while searching for information. Please try again."
 
 async def entrypoint(ctx: JobContext):
     initial_ctx = llm.ChatContext().append(
@@ -96,14 +114,23 @@ async def entrypoint(ctx: JobContext):
         text=system_prompt,
     )
 
-    logger.info(f"Connecting to room {ctx.room.name}")
+    logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    participant = await ctx.wait_for_participant()
-    logger.info(f"Starting voice assistant for participant {participant.identity}")
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=30)
+        logger.info(f"Participant {participant.identity} joined")
+    except asyncio.TimeoutError:
+        logger.error("Timeout waiting for a participant to join.")
+        return
+    except Exception as e:
+        logger.error(f"Error while waiting for participant: {e}")
+        return
 
-    assistant = VoicePipelineAgent(
-        vad=silero.VAD.load(),
+    RAGTool = RAG()
+
+    assistant = VoiceAssistant(
+        vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(),
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=elevenlabs.TTS(
@@ -111,17 +138,17 @@ async def entrypoint(ctx: JobContext):
             api_key=os.getenv("ELEVENLABS_API_KEY")
         ),
         chat_ctx=initial_ctx,
-        fnc_ctx=fnc_ctx,
+        turn_detector=turn_detector.EOUModel(),
+        fnc_ctx=RAGTool,
     )
 
     assistant.start(ctx.room, participant)
-
-    await assistant.say("Hello! How can I assist you today?", allow_interruptions=True)
+    await assistant.say("Hello I'm Jenna! How can I assist you today?", allow_interruptions=True)
 
 if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prewarm_fnc=lambda proc: proc.userdata.update({"vad": silero.VAD.load()}),
+            prewarm_fnc=prewarm,
         ),
     )

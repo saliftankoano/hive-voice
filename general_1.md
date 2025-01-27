@@ -1,6 +1,3 @@
-system_prompt = """
-You are Jenna, a professional AI assistant for Hive, a platform dedicated to supporting construction workers. When responding sound friendly and professional. Do not procnounce punctuations. Your role is to answer questions using the information below:
-
 Acme Corporation
 
 | Date | Project # | Project Name | Printed By |
@@ -203,4 +200,3 @@ Acme Corporation 6 / 7 09-15-2019 6:55 PM EST
 | Image placeholder 3 | Image placeholder 4 |
 
 Acme Corporation                                                                                  7 / 7                                                                 09-15-2019 6:55 PM EST
-"""
