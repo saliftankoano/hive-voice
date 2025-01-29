@@ -94,12 +94,9 @@ class RAG(llm.FunctionContext):
             
             logger.debug(f"Query time: {time.time() - start_time:.2f}s")
             
-            # Format response with context
             response = f"""
-            Based on the following contexts:
+            Here are relevant contexts from the databse to help answer the question :
             {combined_context}
-            
-            Here's the answer to your question: {query}
             """
             
             return response

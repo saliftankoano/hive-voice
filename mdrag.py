@@ -24,7 +24,7 @@ class DocumentProcessor:
     def __init__(self):
         self.openai_client = AsyncOpenAI()
         
-        # Initialize Pinecone with new pattern
+        # Initialize Pinecone
         self.pc = Pinecone(
             api_key=os.getenv("PINECONE_API_KEY")
         )
@@ -79,7 +79,7 @@ class DocumentProcessor:
     def chunk_text(self, text: str, metadata: dict = None, max_chunk_size: int = 1000) -> List[dict]:
         """Split text into chunks with overlap and preserve metadata and table integrity."""
         chunks = []
-        overlap = 100  # Number of characters to overlap between chunks
+        overlap = 100
         
         if len(text) <= max_chunk_size:
             return [{'text': text, 'metadata': metadata}]
@@ -91,7 +91,6 @@ class DocumentProcessor:
             if end >= len(text):
                 chunk_text = text[start:]
             else:
-                # Try to find a period or newline for a clean break
                 next_period = text.find('.', end - 50, end + 50)
                 next_newline = text.find('\n', end - 50, end + 50)
                 
@@ -205,3 +204,4 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+    
